@@ -148,6 +148,14 @@
   #voicePick { max-width:210px; padding:6px 10px; border-radius:16px; font-size:11px;
     background:rgba(255,255,255,.09); color:#fff; border:1px solid rgba(255,255,255,.25); }
   #voicePick option { background:#16223d; color:#fff; }
+  .warn { margin-top:12px; max-width:380px; font-size:12px; line-height:1.5; text-align:center;
+    background:rgba(180,83,9,.28); border:1px solid #f59e0b; border-radius:10px; padding:9px 12px; }
+  .warn.hidden { display:none; }
+  #diagBox { margin-top:12px; max-width:380px; width:100%; max-height:34vh; overflow:auto;
+    background:rgba(0,0,0,.55); border:1px solid rgba(255,255,255,.2); border-radius:8px;
+    padding:9px 11px; font:11px/1.5 ui-monospace, Menlo, monospace; white-space:pre-wrap;
+    word-break:break-word; text-align:left; }
+  #diagBox.hidden { display:none; }
 
   .settings { display:flex; align-items:center; gap:8px; margin-top:16px; flex-wrap:wrap; justify-content:center; }
   .settings .small { font-size:10px; opacity:.5; letter-spacing:1.5px; }
@@ -250,7 +258,13 @@
         <span class="small">VOICE</span>
         <select id="voicePick" aria-label="Choose the talking voice"></select>
         <button id="voiceTest" class="seg">🔊 TEST</button>
+        <button id="voiceDiag" class="seg">VOICE CHECK</button>
       </div>
+      <div id="inappWarn" class="warn hidden">
+        ⚠️ You opened this inside another app’s browser, which usually has no
+        talking voice. Tap the ⋯ menu and choose <b>Open in Chrome</b> (or Safari).
+      </div>
+      <pre id="diagBox" class="hidden"></pre>
     </div>
   </div>
 
@@ -524,6 +538,15 @@ const Sfx = (() => {
 
   /* ---------------- voice selection ---------------- */
   let chosenVoice = null, forcedVoice = null, speechPrimed = false, keepAlive = null;
+  let speaking = false, speechTried = 0, speechDiag = [];
+  function note(msg) {
+    speechDiag.push(msg);
+    if (speechDiag.length > 12) speechDiag.shift();
+  }
+  // In-app browsers (links opened inside WhatsApp, Facebook, Instagram) very
+  // often have no text-to-speech engine at all.
+  const IS_INAPP = /; wv\)|FB_IAB|FBAV|Instagram|Line\/|MicroMessenger|WhatsApp/i
+    .test(navigator.userAgent);
   const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent)
     || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
@@ -751,28 +774,85 @@ const Sfx = (() => {
       } catch (e) { /* nothing to do */ }
     },
     speechAvailable() { return !!window.speechSynthesis; },
+    isInApp() { return IS_INAPP; },
+    speechReport() {
+      const s = window.speechSynthesis;
+      return {
+        supported: !!s,
+        voices: s ? (s.getVoices() || []).length : 0,
+        primed: speechPrimed,
+        attempts: speechTried,
+        inApp: IS_INAPP,
+        chosen: (pickVoice() || {}).name || "(system default)",
+        flags: s ? { speaking: s.speaking, pending: s.pending, paused: s.paused }
+                 : { speaking: false, pending: false, paused: false },
+        log: speechDiag.slice()
+      };
+    },
     voiceList() { return listVoices(); },
     setVoice(name) { forcedVoice = name || null; chosenVoice = null; },
     currentVoiceName() { const v = pickVoice(); return v ? v.name : ""; },
 
+    isSpeaking() { return speaking; },
+    diag() { return speechDiag; },
+
     say(text, opts) {
-      if (muted || !window.speechSynthesis) return;
+      if (!window.speechSynthesis) { note("no speechSynthesis in this browser"); return; }
+      if (muted) { note("muted"); return; }
       const synth = window.speechSynthesis;
       const o = opts || {};
       const go = () => {
         try {
           const u = new SpeechSynthesisUtterance(text);
-          const v = pickVoice();
-          if (v) u.voice = v;
-          u.lang = (v && v.lang) || "en-US";
+          // Re-resolve the voice by NAME every time. Android Chrome silently
+          // refuses to speak when handed a stale voice object from an earlier
+          // getVoices() call — this was almost certainly the Android silence.
+          const live = synth.getVoices() || [];
+          const wanted = pickVoice();
+          const fresh = wanted ? live.find(v => v.name === wanted.name) : null;
+          if (fresh) u.voice = fresh;              // omit entirely if not found
+          u.lang = (fresh && fresh.lang) || "en-US";
           u.rate = o.rate == null ? 0.94 : o.rate;
           u.pitch = o.pitch == null ? 1.1 : o.pitch;
           u.volume = 1;
-          u.onend = stopKeepAlive;
-          u.onerror = stopKeepAlive;
+          u.onstart = () => { speaking = true; note("speaking: " + text.slice(0, 40)); };
+          u.onend = () => { speaking = false; stopKeepAlive(); note("finished ok"); };
+          u.onerror = e => {
+            speaking = false; stopKeepAlive();
+            note("ERROR: " + ((e && e.error) || "unknown"));
+          };
+          // A hung queue is the classic Android failure: the engine reports
+          // speaking:true forever but never fires onstart and never makes a
+          // sound. Clear it before every utterance, and un-pause a stuck one.
+          if ((synth.speaking || synth.pending) && !speaking) {
+            note("clearing hung queue");
+            try { synth.cancel(); } catch (e) {}
+          }
+          if (synth.paused) { try { synth.resume(); } catch (e) {} }
+
+          speechTried++;
           synth.speak(u);
           startKeepAlive();
-        } catch (e) { /* ignore */ }
+
+          // Watchdog. Android TTS engines can take a couple of seconds to warm
+          // up, so only step in once the engine claims to be completely idle —
+          // cancelling a slow-but-working utterance would cause the very
+          // silence we're trying to fix.
+          setTimeout(() => {
+            if (speaking) return;                          // started fine
+            if (synth.speaking || synth.pending) {         // slow, but alive
+              note("slow start — leaving it alone");
+              return;
+            }
+            if (!o.__retry) {
+              note("dropped silently — retrying once");
+              try { synth.cancel(); } catch (e) {}
+              setTimeout(() => Sfx.say(text, Object.assign({}, o, { __retry: true })), 200);
+            } else {
+              note("still silent — this browser is blocking speech");
+            }
+          }, 2500);
+        } catch (e) { note("threw: " + e.message); }
       };
       // iOS drops a speak() issued in the same tick as cancel(), so give it a beat
       if (o.fresh && (synth.speaking || synth.pending)) { synth.cancel(); setTimeout(go, 130); }
@@ -2027,6 +2107,8 @@ function refreshBoards() {
 let sayCooldown = 0;
 function updateTeacher(dt) {
   if (sayCooldown > 0) { sayCooldown -= dt; return; }
+  // don't stack a new board on top of one still being read out
+  if (Sfx.isSpeaking()) return;
   const base = findSegment(position + playerZ).index;
   for (let i = 0; i < 34; i++) {
     const seg = segments[(base + i) % segments.length];
@@ -2619,7 +2701,11 @@ const $ = id => document.getElementById(id);
 function onTap(el, fn) {
   if (!el) return;
   // a throw inside one handler must never leave a button permanently dead
-  const safe = e => { try { fn(e); } catch (err) { reportError("tap", err); } };
+  // every tap re-asserts the audio/speech unlock — cheap insurance on mobile
+  const safe = e => {
+    try { Sfx.primeSpeech(); } catch (err) { /* ignore */ }
+    try { fn(e); } catch (err) { reportError("tap", err); }
+  };
   let justTouched = false;
   el.addEventListener("touchend", e => {
     justTouched = true;
@@ -2936,8 +3022,28 @@ onTap($("voiceTest"), () => {
   Sfx.unlock();
   Sfx.primeSpeech();
   Sfx.say((playerName ? "Hi " + playerName + "! " : "Hi! ") + "8 times 7 equals 56.", { fresh: true });
+  setTimeout(showVoiceReport, 2200);   // if nothing was heard, the reason is right there
 });
 
+function showVoiceReport() {
+  const box = $("diagBox");
+  const r = Sfx.speechReport();
+  box.textContent =
+    "Talking supported : " + (r.supported ? "yes" : "NO") + "\n" +
+    "Voices installed  : " + r.voices + "\n" +
+    "Unlocked by tap   : " + (r.primed ? "yes" : "NO") + "\n" +
+    "In-app browser    : " + (r.inApp ? "YES — open in Chrome/Safari" : "no") + "\n" +
+    "Voice chosen      : " + r.chosen + "\n" +
+    "Times tried       : " + r.attempts + "\n" +
+    "Engine flags      : speaking=" + r.flags.speaking +
+      " pending=" + r.flags.pending + " paused=" + r.flags.paused + "\n" +
+    "What happened     :\n  " + (r.log.length ? r.log.join("\n  ") : "(nothing yet)") + "\n" +
+    "Browser           : " + navigator.userAgent.slice(0, 120);
+  box.classList.remove("hidden");
+}
+onTap($("voiceDiag"), showVoiceReport);
+
+if (Sfx.isInApp()) $("inappWarn").classList.remove("hidden");
 try { buildPlayerScreen(); } catch (err) { reportError("player screen", err); }
 try { buildVoicePicker(); } catch (err) { reportError("voice list", err); }
 try { buildDriverCards(); } catch (err) { reportError("racer cards", err); }
