@@ -484,11 +484,51 @@ const Sfx = (() => {
   let ac = null, master = null, eng = null, noiseBuf = null;
   let muted = false, running = false, lastGear = -1;
 
+  /* iOS hands the audio session to the speech engine while it talks and often
+     leaves our AudioContext suspended afterwards — which is why the engine and
+     effects went quiet while the voice kept working. Nudge it awake again. */
+  function wakeAudio() {
+    if (!ac || muted) return;
+    if (ac.state === "suspended" && ac.resume) {
+      const p = ac.resume();
+      if (p && p.catch) p.catch(() => {});
+      note("audio context resumed");
+    }
+  }
+
+  /* A looping silent clip keeps iOS in the "playback" audio session, so the
+     effects survive speech and aren't killed by the ringer switch. */
+  let sessionKeeper = null;
+  function holdAudioSession() {
+    if (sessionKeeper) { const p = sessionKeeper.play(); if (p && p.catch) p.catch(() => {}); return; }
+    try {
+      const rate = 8000, n = Math.round(rate * 0.4), bytes = n * 2;
+      const buf = new ArrayBuffer(44 + bytes), v = new DataView(buf);
+      const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+      w(0, "RIFF"); v.setUint32(4, 36 + bytes, true); w(8, "WAVE");
+      w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+      v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+      w(36, "data"); v.setUint32(40, bytes, true);
+      sessionKeeper = document.createElement("audio");
+      sessionKeeper.setAttribute("playsinline", "");
+      sessionKeeper.loop = true;
+      sessionKeeper.volume = 0.001;
+      sessionKeeper.src = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+      const p = sessionKeeper.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) { /* not fatal */ }
+  }
+
   function ready() {
     if (!ac) {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return false;
       ac = new AC();
+      ac.onstatechange = () => {
+        note("context " + ac.state);
+        if (ac.state === "suspended" && !muted) wakeAudio();
+      };
       master = ac.createGain();
       master.gain.value = 0.5;
       master.connect(ac.destination);
@@ -713,7 +753,9 @@ const Sfx = (() => {
   }
 
   return {
-    unlock() { ready(); },
+    unlock() { ready(); holdAudioSession(); wakeAudio(); },
+    wake() { wakeAudio(); },
+    audioState() { return ac ? ac.state : "none"; },
     isMuted() { return muted; },
     toggleMute() {
       muted = !muted;
@@ -827,10 +869,16 @@ const Sfx = (() => {
           u.pitch = o.pitch == null ? 1.1 : o.pitch;
           u.volume = 1;
           u.onstart = () => { speaking = true; note("speaking: " + text.slice(0, 40)); };
-          u.onend = () => { speaking = false; stopKeepAlive(); note("finished ok"); };
+          // iOS steals the audio session to talk; take it straight back so the
+          // engine and effects don't stay dead afterwards
+          u.onend = () => {
+            speaking = false; stopKeepAlive(); note("finished ok");
+            wakeAudio(); setTimeout(wakeAudio, 250);
+          };
           u.onerror = e => {
             speaking = false; stopKeepAlive();
             note("ERROR: " + ((e && e.error) || "unknown"));
+            wakeAudio(); setTimeout(wakeAudio, 250);
           };
           // A hung queue is the classic Android failure: the engine reports
           // speaking:true forever but never fires onstart and never makes a
@@ -3066,6 +3114,8 @@ function showVoiceReport() {
     "Times tried       : " + r.attempts + "\n" +
     "Engine flags      : speaking=" + r.flags.speaking +
       " pending=" + r.flags.pending + " paused=" + r.flags.paused + "\n" +
+    "Sound effects     : audio context is " + Sfx.audioState() +
+      (Sfx.audioState() === "running" ? " (good)" : " — effects will be silent") + "\n" +
     "What happened     :\n  " + (r.log.length ? r.log.join("\n  ") : "(nothing yet)") + "\n" +
     "Browser           : " + navigator.userAgent.slice(0, 120);
   box.classList.remove("hidden");
@@ -3082,7 +3132,7 @@ try { renderChancePips(); } catch (err) { reportError("chances", err); }
 /* =========================================================================
    Main loop
    ========================================================================= */
-let last = Util.timestamp(), acc = 0;
+let last = Util.timestamp(), acc = 0, audioWatch = 0;
 function frame() {
   const now = Util.timestamp();
   const dt = Math.min(1, (now - last) / 1000);
@@ -3090,6 +3140,14 @@ function frame() {
   acc += dt;
   while (acc > step) { update(step); acc -= step; }
   if (state !== "menu" && track && segments.length) render();
+
+  // Safety net: if anything (speech, a phone call, the lock screen) leaves the
+  // audio context suspended, bring it back rather than racing in silence.
+  audioWatch += dt;
+  if (audioWatch > 1) {
+    audioWatch = 0;
+    if (document.body.classList.contains("playing") && Sfx.audioState() === "suspended") Sfx.wake();
+  }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
