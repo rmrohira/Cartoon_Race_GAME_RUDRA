@@ -633,6 +633,9 @@ const Sfx = (() => {
       s.start(t); s.stop(t + 0.08);
     }
     function schedule() {
+      // the audio context is torn down on page unload while this timer is
+      // still ticking — bail out instead of throwing on every beat
+      if (!ac || !bus || ac.state === "closed") { stopTimer(); return; }
       while (nextTime < ac.currentTime + 0.20) {
         const bar = Math.floor(step / 8) % 4;
         const eighth = step % 8;
@@ -649,22 +652,30 @@ const Sfx = (() => {
         step++;
       }
     }
+    function stopTimer() { if (timer) { clearInterval(timer); timer = null; } on = false; }
+
     return {
       start() {
-        if (on || !ac) return;
+        if (on || !ac || ac.state === "closed") return;
         bus = ac.createGain(); bus.gain.value = 0.0001; bus.connect(master);
         bus.gain.setTargetAtTime(0.085, ac.currentTime, 1.2);
         nextTime = ac.currentTime + 0.08; step = 0; on = true;
         timer = setInterval(schedule, 25);
       },
       stop() {
-        if (!on) return;
-        on = false; clearInterval(timer); timer = null;
-        if (bus && ac) { bus.gain.setTargetAtTime(0.0001, ac.currentTime, 0.25); }
+        const wasOn = on;
+        stopTimer();
+        if (wasOn && bus && ac && ac.state !== "closed") {
+          try { bus.gain.setTargetAtTime(0.0001, ac.currentTime, 0.25); } catch (e) {}
+        }
       },
+      /* called when the context is being destroyed */
+      teardown() { stopTimer(); bus = null; },
       duck(v) {
         ducked = v;
-        if (bus && ac) bus.gain.setTargetAtTime(v ? 0.022 : 0.085, ac.currentTime, 0.18);
+        if (bus && ac && ac.state !== "closed") {
+          try { bus.gain.setTargetAtTime(v ? 0.022 : 0.085, ac.currentTime, 0.18); } catch (e) {}
+        }
       }
     };
   })();
@@ -880,6 +891,8 @@ const Sfx = (() => {
     resume() { if (ac && ac.state === "suspended" && !muted) ac.resume(); },
     shutdown() {
       if (window.speechSynthesis) window.speechSynthesis.cancel();
+      stopKeepAlive();
+      Music.teardown();          // stop the beat timer BEFORE the context goes
       running = false; eng = null;
       if (ac) { try { ac.close(); } catch (e) {} ac = null; master = null; }
     },
@@ -1790,6 +1803,19 @@ function displaySpeed() {
 }
 
 function startRace() {
+  // Never start half-configured. If we somehow get here without a pick, send
+  // the player to the screen that still needs answering instead of throwing.
+  if (!driver) {
+    show("screenResult", false); show("screenTrack", false); show("screenDriver", true);
+    flash("Pick a racer first", "#ffd447", 1600);
+    return;
+  }
+  if (!track) {
+    show("screenResult", false); show("screenDriver", false); show("screenTrack", true);
+    flash("Pick a circuit first", "#ffd447", 1600);
+    return;
+  }
+
   buildTrack(track);
   buildBackground(theme);
 
@@ -2703,6 +2729,9 @@ function onTap(el, fn) {
   // a throw inside one handler must never leave a button permanently dead
   // every tap re-asserts the audio/speech unlock — cheap insurance on mobile
   const safe = e => {
+    // `disabled` suppresses click but NOT touchend, so a greyed-out button
+    // still fired on phones. Honour it ourselves.
+    if (el.disabled || el.getAttribute("aria-disabled") === "true") return;
     try { Sfx.primeSpeech(); } catch (err) { /* ignore */ }
     try { fn(e); } catch (err) { reportError("tap", err); }
   };
