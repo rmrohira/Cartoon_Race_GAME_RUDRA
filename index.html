@@ -116,6 +116,39 @@
   .tcard .diff { font-size:10px; margin-top:3px; color:#ffd447; letter-spacing:2px; }
   .tcard .desc { font-size:9px; opacity:.55; margin-top:3px; line-height:1.3; height:24px; }
 
+  /* Every name pulses in turn on the same timing, so no one name is ever the
+     highlighted "default" — they all get an equal moment. */
+  #players { display:flex; gap:16px; flex-wrap:wrap; justify-content:center; margin-bottom:4px; }
+  .pbubble { width:124px; height:124px; border-radius:50%; display:flex; align-items:center;
+    justify-content:center; text-align:center; padding:8px; cursor:pointer;
+    font-size:18px; font-weight:bold; letter-spacing:.5px; line-height:1.25;
+    border:3px solid rgba(255,255,255,.28); background:rgba(255,255,255,.07);
+    animation:namePulse 3.9s ease-in-out infinite; }
+  .pbubble:nth-child(1) { animation-delay:0s; }
+  .pbubble:nth-child(2) { animation-delay:1.3s; }
+  .pbubble:nth-child(3) { animation-delay:2.6s; }
+  .pbubble.active { animation:none; border-color:#ffd447; background:rgba(255,212,71,.18);
+    box-shadow:0 0 26px rgba(255,212,71,.5); }
+  @keyframes namePulse {
+    0%, 100% { border-color:rgba(255,255,255,.28); box-shadow:none; transform:scale(1); }
+    10%      { border-color:#ffd447; box-shadow:0 0 24px rgba(255,212,71,.55); transform:scale(1.07); }
+    26%      { border-color:rgba(255,255,255,.28); box-shadow:none; transform:scale(1); }
+  }
+  @media (prefers-reduced-motion: reduce) { .pbubble { animation:none; } }
+
+  #nameEntry { display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap; justify-content:center; }
+  #nameEntry.hidden { display:none; }
+  #nameInput { padding:11px 14px; font-size:16px; border-radius:22px; text-align:center;
+    border:2px solid rgba(255,255,255,.3); background:rgba(255,255,255,.1); color:#fff; width:200px; }
+  #nameInput::placeholder { color:rgba(255,255,255,.45); }
+  #nameEntry .btn { margin-top:0; }
+
+  .voicebar { display:flex; align-items:center; gap:8px; margin-top:18px; flex-wrap:wrap; justify-content:center; }
+  .voicebar .small { font-size:10px; opacity:.5; letter-spacing:1.5px; }
+  #voicePick { max-width:210px; padding:6px 10px; border-radius:16px; font-size:11px;
+    background:rgba(255,255,255,.09); color:#fff; border:1px solid rgba(255,255,255,.25); }
+  #voicePick option { background:#16223d; color:#fff; }
+
   .settings { display:flex; align-items:center; gap:8px; margin-top:16px; flex-wrap:wrap; justify-content:center; }
   .settings .small { font-size:10px; opacity:.5; letter-spacing:1.5px; }
   .seg { padding:6px 14px; font-size:11px; font-weight:bold; letter-spacing:1px; border-radius:16px; cursor:pointer;
@@ -201,8 +234,28 @@
     <button id="bGas">▲</button>
   </div>
 
+  <!-- ---------- Who is playing? ---------- -->
+  <div id="screenPlayer" class="overlay">
+    <div class="sheet">
+      <h1>WHO'S DRIVING?</h1>
+      <p class="sub">Tap your name to start. This also switches the talking on — phones only
+      allow sound after you tap.</p>
+      <div id="players"></div>
+      <div id="nameEntry" class="hidden">
+        <input id="nameInput" type="text" maxlength="14" placeholder="Type your name"
+               autocomplete="off" autocapitalize="words" spellcheck="false">
+        <button id="nameOk" class="btn">THAT'S ME</button>
+      </div>
+      <div class="voicebar">
+        <span class="small">VOICE</span>
+        <select id="voicePick" aria-label="Choose the talking voice"></select>
+        <button id="voiceTest" class="seg">🔊 TEST</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ---------- Driver select ---------- -->
-  <div id="screenDriver" class="overlay">
+  <div id="screenDriver" class="overlay hidden">
     <div class="sheet">
       <h1>TURBO GRAND PRIX</h1>
       <p class="sub">Pick your racer — 20 laps, 10 chances. Names are alphabet-shifted for fun; every driver here is an original cartoon, not a real person.</p>
@@ -242,6 +295,7 @@
         <button id="againBtn" class="btn">RACE AGAIN</button>
         <button id="changeBtn" class="btn ghost">CHANGE CIRCUIT</button>
         <button id="garageBtn" class="btn ghost">GARAGE</button>
+        <button id="whoBtn" class="btn ghost">CHANGE PLAYER</button>
       </div>
     </div>
   </div>
@@ -469,28 +523,60 @@ const Sfx = (() => {
   }
 
   /* ---------------- voice selection ---------------- */
-  let chosenVoice = null;
-  const VOICE_WISHLIST = [
-    "Samantha", "Ava", "Allison", "Susan", "Nicky",       // Apple US female
-    "Google US English",                                   // Chrome
-    "Microsoft Aria", "Microsoft Jenny", "Microsoft Michelle", "Zira" // Edge/Windows
-  ];
+  let chosenVoice = null, forcedVoice = null, speechPrimed = false, keepAlive = null;
+  const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+  // Android Chrome silently stops long utterances after ~15s unless nudged.
+  function startKeepAlive() {
+    if (IS_IOS) return;                       // the nudge misbehaves on iOS
+    stopKeepAlive();
+    keepAlive = setInterval(() => {
+      const s = window.speechSynthesis;
+      if (!s) return stopKeepAlive();
+      if (s.speaking) { try { s.resume(); } catch (e) {} } else stopKeepAlive();
+    }, 6000);
+  }
+  function stopKeepAlive() { if (keepAlive) { clearInterval(keepAlive); keepAlive = null; } }
+
+  // clearest-sounding voices first; "enhanced"/"premium" are the good downloads
+  function voiceScore(v) {
+    let s = 0;
+    if (/^en[-_]US/i.test(v.lang)) s += 60;
+    else if (/^en/i.test(v.lang)) s += 25;
+    if (/enhanced|premium|neural|natural/i.test(v.name)) s += 40;
+    if (/Samantha|Ava|Allison|Susan|Nicky|Joana|Jenny|Aria|Michelle|Zira/i.test(v.name)) s += 30;
+    if (/Google US English/i.test(v.name)) s += 28;
+    // joke / legacy voices sound awful reading maths — push them to the bottom
+    if (/^(albert|bahh|boing|bubbles|cellos|deranged|jester|organ|superstar|trinoids|whisper|wobble|zarvox|bells|junior|ralph|fred|kathy|princess|bruce|agnes|vicki|victoria|grandma|grandpa|rocko|shelley|sandy|flo|eddy|reed|good news|bad news)\b/i.test(v.name)) s -= 120;
+    if (/compact|eloquence|novelty/i.test(v.name)) s -= 60;
+    if (v.localService) s += 5;
+    return s;
+  }
+  function listVoices() {
+    if (!window.speechSynthesis) return [];
+    const vs = window.speechSynthesis.getVoices() || [];
+    return vs.filter(v => /^en/i.test(v.lang)).sort((a, b) => voiceScore(b) - voiceScore(a));
+  }
   function pickVoice() {
     if (chosenVoice) return chosenVoice;
     if (!window.speechSynthesis) return null;
     const vs = window.speechSynthesis.getVoices();
-    if (!vs || !vs.length) return null;
-    const us = vs.filter(v => /^en[-_]US/i.test(v.lang));
-    for (const want of VOICE_WISHLIST) {
-      const hit = (us.length ? us : vs).find(v => v.name.indexOf(want) >= 0);
+    if (!vs || !vs.length) return null;        // not loaded yet; default voice is used
+    if (forcedVoice) {
+      const hit = vs.find(v => v.name === forcedVoice);
       if (hit) return (chosenVoice = hit);
     }
-    const female = us.find(v => /female|woman/i.test(v.name));
-    chosenVoice = female || us[0] || vs.find(v => /^en/i.test(v.lang)) || vs[0];
+    const ranked = listVoices();
+    chosenVoice = ranked[0] || vs[0];
     return chosenVoice;
   }
   if (window.speechSynthesis) {
-    window.speechSynthesis.onvoiceschanged = () => { chosenVoice = null; pickVoice(); };
+    window.speechSynthesis.onvoiceschanged = () => {
+      chosenVoice = null;
+      pickVoice();
+      if (typeof window.__onVoices === "function") window.__onVoices();
+    };
   }
 
   /* ---------------- background music ----------------
@@ -652,18 +738,45 @@ const Sfx = (() => {
     },
     /* Read the maths out loud in a US English voice, preferring a female one.
        Voices load asynchronously, so this re-picks until the list arrives. */
+    /* Phones only let a page speak after a real finger tap, and they only stay
+       unlocked if the very first utterance came from inside that tap. This is
+       why the voice worked on the Mac but was silent on iPhone and Android. */
+    primeSpeech() {
+      if (speechPrimed || !window.speechSynthesis) return;
+      try {
+        const u = new SpeechSynthesisUtterance(" ");
+        u.volume = 0; u.rate = 1;
+        window.speechSynthesis.speak(u);
+        speechPrimed = true;
+      } catch (e) { /* nothing to do */ }
+    },
+    speechAvailable() { return !!window.speechSynthesis; },
+    voiceList() { return listVoices(); },
+    setVoice(name) { forcedVoice = name || null; chosenVoice = null; },
+    currentVoiceName() { const v = pickVoice(); return v ? v.name : ""; },
+
     say(text, opts) {
       if (muted || !window.speechSynthesis) return;
+      const synth = window.speechSynthesis;
       const o = opts || {};
-      const u = new SpeechSynthesisUtterance(text);
-      const v = pickVoice();
-      if (v) u.voice = v;
-      u.lang = "en-US";
-      u.rate = o.rate == null ? 0.94 : o.rate;
-      u.pitch = o.pitch == null ? 1.1 : o.pitch;
-      u.volume = 1;
-      if (o.fresh) window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(u);
+      const go = () => {
+        try {
+          const u = new SpeechSynthesisUtterance(text);
+          const v = pickVoice();
+          if (v) u.voice = v;
+          u.lang = (v && v.lang) || "en-US";
+          u.rate = o.rate == null ? 0.94 : o.rate;
+          u.pitch = o.pitch == null ? 1.1 : o.pitch;
+          u.volume = 1;
+          u.onend = stopKeepAlive;
+          u.onerror = stopKeepAlive;
+          synth.speak(u);
+          startKeepAlive();
+        } catch (e) { /* ignore */ }
+      };
+      // iOS drops a speak() issued in the same tick as cancel(), so give it a beat
+      if (o.fresh && (synth.speaking || synth.pending)) { synth.cancel(); setTimeout(go, 130); }
+      else go();
     },
     sayLines(lines) {
       // one utterance for the whole board so the speech matches what is shown
@@ -2658,12 +2771,18 @@ function showResults() {
   if (dnf) {
     title.textContent = "OUT OF CHANCES";
     title.style.color = "#ef4444";
-    sub.textContent = "All " + MAX_CHANCES + " chances used up — " + driver.name + " retires from the " + track.name + " Grand Prix.";
+    sub.textContent = "All " + MAX_CHANCES + " chances used up — "
+      + (playerName || driver.name) + " retires from the " + track.name + " Grand Prix.";
+    Sfx.say("Out of chances. Try again " + (playerName || "") + "!", { fresh: true });
   } else {
     const p = finishPos;
     title.textContent = p === 1 ? "🏆 RACE WINNER!" : "CHEQUERED FLAG";
     title.style.color = p === 1 ? "#ffd447" : "#fff";
-    sub.textContent = driver.name + " finishes " + ordinal(p) + " of " + (cars.length + 1) + " at " + track.name + ".";
+    sub.textContent = (playerName ? playerName + ", racing as " + driver.name + ", finishes "
+                                  : driver.name + " finishes ")
+      + ordinal(p) + " of " + (cars.length + 1) + " at " + track.name + ".";
+    Sfx.say((playerName ? playerName + ", you finished " : "You finished ") + ordinal(p) + "!",
+            { fresh: true });
   }
   stats.innerHTML =
     `<div class="k">Position</div><div class="v">${dnf ? "DNF" : "P" + finishPos}</div>
@@ -2673,6 +2792,73 @@ function showResults() {
      <div class="k">Chances left</div><div class="v">${chances} / ${MAX_CHANCES}</div>`;
   show("screenResult", true);
 }
+
+/* =========================================================================
+   Who's playing.  The two names are shuffled and every bubble pulses on the
+   same cycle, so the screen never looks like it favours one child.
+   Tapping a name is also the finger-tap that unlocks speech on phones.
+   ========================================================================= */
+let playerName = "";
+
+function buildPlayerScreen() {
+  const host = $("players");
+  host.innerHTML = "";
+  const names = ["Rudra", "Siddy"];
+  if (Math.random() < 0.5) names.reverse();           // no fixed running order
+  const bubbles = names.concat(["Someone else"]);
+
+  bubbles.forEach(nm => {
+    const b = document.createElement("div");
+    b.className = "pbubble";
+    b.setAttribute("role", "button");
+    b.setAttribute("tabindex", "0");
+    b.textContent = nm;
+    onTap(b, () => {
+      Sfx.unlock();
+      Sfx.primeSpeech();                              // must happen inside the tap
+      document.querySelectorAll(".pbubble").forEach(x => x.classList.remove("active"));
+      b.classList.add("active");
+      if (nm === "Someone else") {
+        $("nameEntry").classList.remove("hidden");
+        setTimeout(() => $("nameInput").focus(), 60);
+      } else {
+        $("nameEntry").classList.add("hidden");
+        choosePlayer(nm);
+      }
+    });
+    host.appendChild(b);
+  });
+}
+
+function choosePlayer(nm) {
+  playerName = (nm || "").trim().slice(0, 14) || "Champ";
+  Sfx.unlock();
+  Sfx.primeSpeech();
+  // first real sentence, spoken from inside the tap so phones keep it unlocked
+  Sfx.say("Hello " + playerName + "! Let's go racing.", { rate: 0.95 });
+  show("screenPlayer", false);
+  show("screenDriver", true);
+}
+
+function buildVoicePicker() {
+  const sel = $("voicePick");
+  if (!sel) return;
+  const vs = Sfx.voiceList();
+  sel.innerHTML = "";
+  if (!vs.length) {
+    sel.innerHTML = '<option>Default voice</option>';
+    return;
+  }
+  const current = Sfx.currentVoiceName();
+  vs.forEach(v => {
+    const o = document.createElement("option");
+    o.value = v.name;
+    o.textContent = v.name.replace(/\s*\(.*?\)\s*/g, " ").trim() + " · " + v.lang;
+    if (v.name === current) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+window.__onVoices = buildVoicePicker;
 
 /* =========================================================================
    Wiring.  Buttons are connected BEFORE any of the heavy set-up runs — if
@@ -2728,9 +2914,32 @@ onTap($("trackGo"), () => startRace());
 onTap($("againBtn"), () => startRace());
 onTap($("changeBtn"), () => { show("screenResult", false); show("screenTrack", true); state = "menu"; document.body.classList.remove("playing"); });
 onTap($("garageBtn"), () => { show("screenResult", false); show("screenDriver", true); state = "menu"; document.body.classList.remove("playing"); });
+onTap($("whoBtn"), () => { show("screenResult", false); show("screenPlayer", true); state = "menu"; document.body.classList.remove("playing"); });
+onTap($("whoBtn"), () => { show("screenResult", false); show("screenPlayer", true); state = "menu"; document.body.classList.remove("playing"); });
 
 /* Heavy set-up last, and each piece isolated: a failure while drawing the
    track thumbnails must never take the racer picker down with it. */
+onTap($("nameOk"), () => {
+  const v = $("nameInput").value.trim();
+  if (v) choosePlayer(v);
+  else $("nameInput").focus();
+});
+$("nameInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); const v = e.target.value.trim(); if (v) choosePlayer(v); }
+});
+$("voicePick").addEventListener("change", e => {
+  Sfx.setVoice(e.target.value);
+  Sfx.primeSpeech();
+  Sfx.say("Hi! This is my voice.", { fresh: true });
+});
+onTap($("voiceTest"), () => {
+  Sfx.unlock();
+  Sfx.primeSpeech();
+  Sfx.say((playerName ? "Hi " + playerName + "! " : "Hi! ") + "8 times 7 equals 56.", { fresh: true });
+});
+
+try { buildPlayerScreen(); } catch (err) { reportError("player screen", err); }
+try { buildVoicePicker(); } catch (err) { reportError("voice list", err); }
 try { buildDriverCards(); } catch (err) { reportError("racer cards", err); }
 try { buildTrackCards(); } catch (err) { reportError("circuit cards", err); }
 try { renderChancePips(); } catch (err) { reportError("chances", err); }
